@@ -59,7 +59,7 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
-    timeout = 5
+    timeout = 30
     lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
