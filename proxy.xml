@@ -1,0 +1,28 @@
+<Config>
+    <SSLGateWay>
+        <sslkey>/etc/proxy/ca.key</sslkey>
+        <sslcert>/etc/proxy/ca.crt</sslcert>
+        <sslport>1443</sslport>
+        <ssladdress>0.0.0.0</ssladdress>
+        <intercept>0</intercept>
+        <verbose>0</verbose>
+        <Forward>
+           <divert>local,http://192.168.0.1:80
+           </divert>
+           <headers>X-Forwarded-Port,80
+           </headers>
+           <headers>X-Forwarded-Protocol,http
+           </headers>
+           <useragent>mozilla,chrome
+           </useragent>
+        </Forward>
+        <rejectunknownforward>1</rejectunknownforward>
+    </SSLGateWay>
+    <Proxy>
+        <sslkey>/etc/proxy/ca.key</sslkey>
+        <port>8080</port>
+        <address>0.0.0.0</address>
+        <intercept>0</intercept>
+        <verbose>0</verbose>
+    </Proxy>
+</Config>

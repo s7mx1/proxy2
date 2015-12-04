@@ -12,19 +12,41 @@ import zlib
 import time
 import json
 import re
+from xml.etree.ElementTree import Element,SubElement,ElementTree, parse
 from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 from SocketServer import ThreadingMixIn
 from cStringIO import StringIO
 from subprocess import Popen, PIPE
 from HTMLParser import HTMLParser
+import logging
+import logging.handlers
 
+def set_logger(log_file):
+    logger = logging.getLogger('')
+    logger.setLevel(logging.DEBUG)
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG)
+    console.setFormatter(logging.Formatter('[%(asctime)s] %(message)s'))
+    hdlr=logging.handlers.RotatingFileHandler(log_file,maxBytes=1048576,backupCount=5)
+    hdlr.setFormatter(logging.Formatter('[%(asctime)s] %(message)s'))
+    hdlr.setLevel(logging.DEBUG)
+    logger.addHandler(hdlr)
+    logger.addHandler(console)
+    return logger,console
+
+
+def log_with_color(c, s):
+    global console
+    global logger
+    console.setFormatter(logging.Formatter("[%s]\r\n\x1b[%dm%s\x1b[0m" %  ('%(asctime)s',c, '%(message)s')))
+    logger.debug(s)
+    console.setFormatter(logging.Formatter('[%(asctime)s] %(message)s'))
 
 def with_color(c, s):
     return "\x1b[%dm%s\x1b[0m" % (c, s)
 
-
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    address_family = socket.AF_INET6
+    address_family = socket.AF_INET
     daemon_threads = True
 
     def handle_error(self, request, client_address):
@@ -37,16 +59,13 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
-    cakey = 'ca.key'
-    cacert = 'ca.crt'
-    certkey = 'cert.key'
-    certdir = 'certs/'
     timeout = 5
     lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
         self.tls = threading.local()
         self.tls.conns = {}
+        #self.config = config
 
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
@@ -58,26 +77,25 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.log_message(format, *args)
 
     def do_CONNECT(self):
-        if os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
+        if self.config["intercept"]=="1" and "sslkey" in self.config:
             self.connect_intercept()
         else:
             self.connect_relay()
 
     def connect_intercept(self):
         hostname = self.path.split(':')[0]
-        certpath = "%s/%s.crt" % (self.certdir.rstrip('/'), hostname)
-
+        certpath = "/cache/certs/%s.crt" % hostname
         with self.lock:
             if not os.path.isfile(certpath):
                 epoch = "%d" % (time.time() * 1000)
-                p1 = Popen(["openssl", "req", "-new", "-key", self.certkey, "-subj", "/CN=%s" % hostname], stdout=PIPE)
-                p2 = Popen(["openssl", "x509", "-req", "-days", "3650", "-CA", self.cacert, "-CAkey", self.cakey, "-set_serial", epoch, "-out", certpath], stdin=p1.stdout, stderr=PIPE)
+                p1 = Popen(["openssl", "req", "-new", "-key", self.config["sslkey"], "-subj", "/CN=%s" % hostname], stdout=PIPE)
+                p2 = Popen(["openssl", "x509", "-req", "-days", "3650", "-CA", self.config["sslkey"].replace("key","crt"), "-CAkey", self.config["sslkey"], "-set_serial", epoch, "-out", certpath], stdin=p1.stdout, stderr=PIPE)
                 p2.communicate()
 
         self.wfile.write("%s %d %s\r\n" % (self.protocol_version, 200, 'Connection Established'))
         self.end_headers()
 
-        self.connection = ssl.wrap_socket(self.connection, keyfile=self.certkey, certfile=certpath, server_side=True)
+        self.connection = ssl.wrap_socket(self.connection, keyfile=self.config["sslkey"], certfile=certpath, server_side=True)
         self.rfile = self.connection.makefile("rb", self.rbufsize)
         self.wfile = self.connection.makefile("wb", self.wbufsize)
 
@@ -113,19 +131,41 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 other.sendall(data)
 
     def do_GET(self):
-        if self.path == 'http://proxy2.test/':
-            self.send_cacert()
-            return
+        #if self.path == 'http://proxy2.test/':
+        #    self.send_cacert()
+        #    return
 
         req = self
         content_length = int(req.headers.get('Content-Length', 0))
         req_body = self.rfile.read(content_length) if content_length else None
-
         if req.path[0] == '/':
-            if isinstance(self.connection, ssl.SSLSocket):
-                req.path = "https://%s%s" % (req.headers['Host'], req.path)
+            if "forward" in self.config:
+                CHECK_FOR_REJECT=True
+                divert=self.config["forward"]["divert"].split(",")
+                if "rejectunknownforward" not in self.config["forward"]:
+                    self.config["forward"]["rejectunknownforward"] = "1"
+                if req.path.lower() =="/"+divert[0] or req.path.lower().startswith("/"+divert[0]+"/"):
+                    if "useragent" in self.config["forward"]:
+                        user_agent_match = False
+                        for user_agent in self.config["forward"]["useragent"].split(","):
+                            if user_agent.lower() in self.headers['User-Agent'].lower():
+                                user_agent_match = True
+                                break
+                        if user_agent_match:
+                            CHECK_FOR_REJECT=False
+                            req.path = "%s%s" % (divert[1],req.path)
+                            if "headers" in self.config["forward"]:
+                                for header in self.config["forward"]["headers"]:
+                                    req.headers[header] = self.config["forward"]["headers"][header]
+                if CHECK_FOR_REJECT and self.config["forward"]["rejectunknownforward"] == "1":
+                    self.send_error(403)
+                    return
             else:
-                req.path = "http://%s%s" % (req.headers['Host'], req.path)
+                if isinstance(self.connection, ssl.SSLSocket):
+                    req.path = "https://%s%s" % (req.headers['Host'], req.path)
+                else:
+                    req.path = "http://%s%s" % (req.headers['Host'], req.path)
+                    
 
         req_body_modified = self.request_handler(req, req_body)
         if req_body_modified is not None:
@@ -155,7 +195,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.send_error(502)
             return
 
-        version_table = {10: 'HTTP/1.0', 11: 'HTTP/1.1'}
+        version_table = {9: 'HTTP/0.9', 10: 'HTTP/1.0', 11: 'HTTP/1.1'}
         setattr(res, 'headers', res.msg)
         setattr(res, 'response_version', version_table[res.version])
 
@@ -218,16 +258,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             raise Exception("Unknown Content-Encoding: %s" % encoding)
         return text
 
-    def send_cacert(self):
-        with open(self.cacert, 'rb') as f:
-            data = f.read()
+    # def send_cacert(self):
+    #     with open(self.cacert, 'rb') as f:
+    #         data = f.read()
 
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, 200, 'OK'))
-        self.send_header('Content-Type', 'application/x-x509-ca-cert')
-        self.send_header('Content-Length', len(data))
-        self.send_header('Connection', 'close')
-        self.end_headers()
-        self.wfile.write(data)
+    #     self.wfile.write("%s %d %s\r\n" % (self.protocol_version, 200, 'OK'))
+    #     self.send_header('Content-Type', 'application/x-x509-ca-cert')
+    #     self.send_header('Content-Length', len(data))
+    #     self.send_header('Connection', 'close')
+    #     self.end_headers()
+    #     self.wfile.write(data)
 
     def print_info(self, req, req_body, res, res_body):
         def parse_qsl(s):
@@ -236,22 +276,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         req_header_text = "%s %s %s\n%s" % (req.command, req.path, req.request_version, req.headers)
         res_header_text = "%s %d %s\n%s" % (res.response_version, res.status, res.reason, res.headers)
 
-        print with_color(33, req_header_text)
+        log_with_color(33, req_header_text)
 
         u = urlparse.urlsplit(req.path)
         if u.query:
             query_text = parse_qsl(u.query)
-            print with_color(32, "==== QUERY PARAMETERS ====\n%s\n" % query_text)
+            log_with_color(32, "==== QUERY PARAMETERS ====\n%s\n" % query_text)
 
         cookie = req.headers.get('Cookie', '')
         if cookie:
             cookie = parse_qsl(re.sub(r';\s*', '&', cookie))
-            print with_color(32, "==== COOKIE ====\n%s\n" % cookie)
+            log_with_color(32, "==== COOKIE ====\n%s\n" % cookie)
 
         auth = req.headers.get('Authorization', '')
         if auth.lower().startswith('basic'):
             token = auth.split()[1].decode('base64')
-            print with_color(31, "==== BASIC AUTH ====\n%s\n" % token)
+            log_with_color(31, "==== BASIC AUTH ====\n%s\n" % token)
 
         if req_body is not None:
             req_body_text = None
@@ -274,14 +314,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 req_body_text = req_body
 
             if req_body_text:
-                print with_color(32, "==== REQUEST BODY ====\n%s\n" % req_body_text)
+                log_with_color(32, "==== REQUEST BODY ====\n%s\n" % req_body_text)
 
-        print with_color(36, res_header_text)
+        log_with_color(36, res_header_text)
 
         cookie = res.headers.get('Set-Cookie', '')
         if cookie:
             cookie = parse_qsl(re.sub(r';\s*', '&', cookie))
-            print with_color(31, "==== SET-COOKIE ====\n%s\n" % cookie)
+            log_with_color(31, "==== SET-COOKIE ====\n%s\n" % cookie)
 
         if res_body is not None:
             res_body_text = None
@@ -302,12 +342,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 m = re.search(r'<title[^>]*>([\s\S]+?)</title>', res_body, re.I)
                 if m:
                     h = HTMLParser()
-                    print with_color(32, "==== HTML TITLE ====\n%s\n" % h.unescape(m.group(1).decode('utf-8')))
+                    log_with_color(32, "==== HTML TITLE ====\n%s\n" % h.unescape(m.group(1).decode('utf-8')))
             elif content_type.startswith('text/') and len(res_body) < 1024:
                 res_body_text = res_body
 
             if res_body_text:
-                print with_color(32, "==== RESPONSE BODY ====\n%s\n" % res_body_text)
+                log_with_color(32, "==== RESPONSE BODY ====\n%s\n" % res_body_text)
 
     def request_handler(self, req, req_body):
         pass
@@ -316,23 +356,106 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def save_handler(self, req, req_body, res, res_body):
-        self.print_info(req, req_body, res, res_body)
+        if self.config["verbose"] == "1":
+            self.print_info(req, req_body, res, res_body)
+        else:
+            pass
 
+class SSLProxyRequestHandler(ProxyRequestHandler):
+    def __init__(self, *args, **kwargs):
+        ProxyRequestHandler.__init__(self, *args, **kwargs)
+    
 
-def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer, protocol="HTTP/1.1"):
-    if sys.argv[1:]:
-        port = int(sys.argv[1])
-    else:
-        port = 8080
-    server_address = ('', port)
+def xml_iterparent(tree):
+    for parent in tree.getiterator():
+        for child in parent:
+            yield parent, child
 
-    HandlerClass.protocol_version = protocol
-    httpd = ServerClass(server_address, HandlerClass)
-
-    sa = httpd.socket.getsockname()
-    print "Serving HTTP Proxy on", sa[0], "port", sa[1], "..."
-    httpd.serve_forever()
-
+def parse_config_file(config_file):
+    Root =parse(config_file).getroot()
+    config_dict={}
+    for parent,child in xml_iterparent(Root):
+        if parent.tag == "Config":
+            if len(child.text.rstrip()) == 0:
+                config_dict[child.tag]={}
+            else:
+                config_dict[child.tag]=child.text.rstrip()
+    for parent,child in xml_iterparent(Root):
+        if parent.tag in config_dict:
+            ### SSLGateWay tag
+            if parent.tag == "SSLGateWay":
+                config_dict[parent.tag][child.tag]=child.text.rstrip()
+                if child.tag == "Forward":
+                    if "forward" not in config_dict[parent.tag]:
+                        config_dict[parent.tag]["forward"]={}
+                    for sub_parent,sub_child in xml_iterparent(child):
+                        if sub_child.tag == "headers":
+                            if "headers" not in config_dict[parent.tag]["forward"]:
+                                config_dict[parent.tag]["forward"]["headers"]={}
+                            config_dict[parent.tag]["forward"]["headers"][sub_child.text.rstrip().split(",")[0]]=sub_child.text.rstrip().split(",")[1]
+                        else:
+                            config_dict[parent.tag]["forward"][sub_child.tag]=sub_child.text.rstrip()
+            ### Proxy tag
+            if parent.tag == "Proxy":
+                config_dict[parent.tag][child.tag]=child.text.rstrip()
+    return config_dict
 
 if __name__ == '__main__':
-    test()
+    config=parse_config_file("/etc/proxy/proxy.xml")
+    logger,console = set_logger("/var/log/proxy.log")
+    
+    
+    ServerClass=ThreadingHTTPServer
+    
+    if "SSLGateWay" in config:
+        if "sslkey" in config["SSLGateWay"] and "sslport" in config["SSLGateWay"]:
+            if "sslport" not in config["SSLGateWay"]:
+                config["SSLGateWay"]["sslport"] = "443"
+            if "ssladdress" not in config["SSLGateWay"]:
+                config["SSLGateWay"]["ssladdress"] = ""
+            if "intercept" not in config["SSLGateWay"]:
+                config["SSLGateWay"]["intercept"]=="0"
+            if "verbose" not in config["SSLGateWay"]:
+                config["SSLGateWay"]["verbose"] = "0"
+            SSLHandlerClass=SSLProxyRequestHandler
+            #(config["SSLGateWay"])
+            SSLHandlerClass.protocol_version = "HTTP/1.0"
+            
+            SSLHandlerClass.config=config["SSLGateWay"]
+            ssl_server_address = (config["SSLGateWay"]["ssladdress"], int(config["SSLGateWay"]["sslport"]))
+            ssl_httpd = ServerClass(ssl_server_address, SSLHandlerClass)
+            ssl_httpd.socket = ssl.wrap_socket(ssl_httpd.socket, keyfile=config["SSLGateWay"]["sslkey"], certfile=config["SSLGateWay"]["sslcert"], server_side=True)
+            sa = ssl_httpd.socket.getsockname()
+            logger.debug("Serving SSL HTTP Gateway on %s port %s ..." % (sa[0], sa[1]))
+            #ssl_httpd.serve_forever()
+            threading.Thread(target=ssl_httpd.serve_forever).start()
+    if "Proxy" in config:
+        if "port" not in config["Proxy"]:
+            config["Proxy"]["port"]="8080"
+        if "address" not in config["Proxy"]:
+            config["Proxy"]["address"]=""
+        if "intercept" not in config["Proxy"]:
+            config["Proxy"]["intercept"]="0"
+        if "verbose" not in config["Proxy"]:
+                config["Proxy"]["verbose"] = "0"
+        HandlerClass=ProxyRequestHandler#(config["Proxy"])
+        HandlerClass.protocol_version = "HTTP/1.1"
+        
+        HandlerClass.config=config["Proxy"]
+        server_address = (config["Proxy"]["address"], int(config["Proxy"]["port"]))
+        httpd = ServerClass(server_address, HandlerClass)
+        sa = httpd.socket.getsockname()
+        logger.debug("Serving HTTP Proxy on %s port %s ..." % (sa[0], sa[1]))
+        #httpd.serve_forever()
+        threading.Thread(target=httpd.serve_forever).start()
+    
+    while True:
+        try:
+            time.sleep(1)
+        except:
+            ssl_httpd.shutdown()
+            httpd.shutdown()
+            break
+            
+            
+    
